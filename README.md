@@ -1,4 +1,4 @@
-# Discord Automated Message Deleter v2.0 🧹
+# Discord Automated Message Deleter v2.0
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -10,44 +10,44 @@ Equipped with an **Adaptive Rate-Limit Shield**, **Humanized Delays & Jitter**, 
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
-- 🛡️ **Anti-Ban & Rate-Limit Shield:**
+- **Anti-Ban & Rate-Limit Shield:**
   - Configurable safety delays (Default: `2.0s`).
   - Randomized human jitter on API requests to avoid automated detection.
   - Automatic handling of HTTP `429 Too Many Requests` responses with dynamic exponential backoff.
   - Automatic 5.0-second cooldown pauses every 15–20 deletions.
 
-- 💬 **Personal DM & Group Chat Deletion:**
+- **Personal DM & Group Chat Deletion:**
   - **Active DMs Queue:** Automatically cleans all open/active 1-on-1 and Group DMs sequentially.
   - **Deep Scan (Hidden / Closed DMs):** Safely discovers and cleans closed DMs with friends using ultra-slow humanized delays (`2.5s - 4.5s`).
   - **Target User ID Queue:** Enter one or multiple User IDs to delete messages in sequential order.
   - **Pick from List:** Interactively view and choose a specific DM conversation.
 
-- 🌐 **Discord Server (Guild) Deletion:**
+- **Discord Server (Guild) Deletion:**
   - Fast server-wide indexing via Discord Search API.
   - Automatic fallback to scanning text channels individually.
   - Support for manual Server ID input or choosing from your joined server list.
 
-- 🔒 **Security & Credentials Protection:**
+- **Security & Credentials Protection:**
   - Linux-style hidden token input (typing does not echo to terminal).
   - Credentials stored safely in local `.env` (ignored by git).
   - Positional argument and CLI flag support.
 
-- 🧪 **Dry-Run Mode:**
+- **Dry-Run Mode:**
   - Preview messages that would be deleted without actually deleting anything.
 
-- 📊 **Detailed Summary Reports:**
+- **Detailed Summary Reports:**
   - Clean formatted table report showing deleted counts, failed counts, and target scopes.
 
 ---
 
-## 🚀 Installation & Setup
+## Installation & Setup
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/your-username/discord-message-deleter.git
-cd discord-message-deleter
+git clone https://github.com/salmanmallah/discord-chat-automation.git
+cd discord-chat-automation
 ```
 
 ### 2. Create Virtual Environment & Install Requirements
@@ -89,7 +89,7 @@ AUTO_CONFIRM=false
 
 ---
 
-## 🔑 How to Get Your Discord Authorization Token
+## How to Get Your Discord Authorization Token
 
 > [!WARNING]
 > **Never share your Discord User Token with anyone.** Anyone with your token has full access to your account.
@@ -105,7 +105,7 @@ AUTO_CONFIRM=false
 
 ---
 
-## 📖 Usage Guide
+## Usage Guide
 
 ### 1. Interactive Menu (Recommended)
 Run the script directly. It will guide you through all available scopes:
@@ -154,7 +154,7 @@ python discord_deleter.py --all-dms --dry-run
 
 ---
 
-## ⚙️ CLI Options Reference
+## CLI Options Reference
 
 | Option | Short | Description |
 |---|---|---|
@@ -171,7 +171,7 @@ python discord_deleter.py --all-dms --dry-run
 
 ---
 
-## ⚠️ Disclaimer & Terms of Service
+## Disclaimer & Terms of Service
 
 This tool is created solely for personal data management and privacy purposes (e.g. deleting your own past messages under GDPR/privacy rights). 
 
@@ -181,6 +181,6 @@ This tool is created solely for personal data management and privacy purposes (e
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the [MIT License](LICENSE).
