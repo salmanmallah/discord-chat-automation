@@ -1,4 +1,4 @@
-# Discord Automated Message Deleter v2.0
+# Discord Automated Message Deleter v2.1
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -6,21 +6,25 @@
 
 A robust, interactive command-line automation tool built in Python to search for and bulk-delete your sent messages across **Discord Servers (Guilds)** and **Personal DMs / Group Chats**.
 
-Equipped with an **Adaptive Rate-Limit Shield**, **Humanized Delays & Jitter**, and **Anti-Ban Cooldown Protections** to safeguard your account.
+Equipped with a **Discord Client Fingerprint Shield**, **Adaptive Rate-Limit Protection**, **Randomized Humanized Delays & Jitter**, **Session Safety Limits**, and **Anti-Ban Cooldown Guards** to safeguard your account.
 
 ---
 
 ## Key Features
 
-- **Anti-Ban & Rate-Limit Shield:**
-  - Configurable safety delays (Default: `2.0s`).
-  - Randomized human jitter on API requests to avoid automated detection.
+- **Anti-Ban & Rate-Limit Shield (v2.1 Hardened):**
+  - **Discord Client Fingerprinting:** Sends `X-Super-Properties`, `Sec-Ch-Ua`, `Sec-Fetch`, and 10+ additional headers that real Discord clients use, reducing detection of non-client API access.
+  - **Wide Humanized Jitter:** Randomized delays with a `0.2s–1.0s` jitter range, plus a 5% chance of an extra `1.5–4.0s` "human thinking" pause to break up repetitive patterns.
+  - **Randomized Cooldown Pauses:** Anti-ban cooldown triggers every `12–25` deletions (randomized interval), with `4–8s` randomized pause duration.
+  - **Capped Retry with Escalating Backoff:** All API rate-limit retries are capped at `5 attempts` with increasing backoff per attempt — no more infinite loops.
+  - **Session Safety Limits:** Warns when `500+` messages are queued, auto-pauses for `15–30s` at the 500-deletion mark, and advises resuming later.
+  - **Adaptive Delay Engine:** Automatically increases delay on rate-limits (up to `8.0s` cap) and slowly recovers after `20` smooth deletions.
+  - Configurable base safety delay (Default: `2.0s`, enforced minimum).
   - Automatic handling of HTTP `429 Too Many Requests` responses with dynamic exponential backoff.
-  - Automatic 5.0-second cooldown pauses every 15–20 deletions.
 
 - **Personal DM & Group Chat Deletion:**
-  - **Active DMs Queue:** Automatically cleans all open/active 1-on-1 and Group DMs sequentially.
-  - **Deep Scan (Hidden / Closed DMs):** Safely discovers and cleans closed DMs with friends using ultra-slow humanized delays (`2.5s - 4.5s`).
+  - **Active DMs Queue:** Automatically cleans all open/active 1-on-1 and Group DMs sequentially with `4–8s` rest between chats.
+  - **Deep Scan (Hidden / Closed DMs):** Safely discovers and cleans closed DMs with friends using ultra-slow humanized delays (`3.0s–6.0s` per friend check, `2.0–4.0s` post-open rest).
   - **Target User ID Queue:** Enter one or multiple User IDs to delete messages in sequential order.
   - **Pick from List:** Interactively view and choose a specific DM conversation.
 
@@ -77,7 +81,7 @@ DISCORD_USER_TOKEN=your_user_token_here
 DISCORD_GUILD_ID=your_server_guild_id_here
 
 # Optional Settings
-# Delay between message deletions in seconds (Recommended: 2.0s for Anti-Ban Safety)
+# Delay between message deletions in seconds (Minimum: 2.0s enforced, Recommended: 2.5s+ for extra safety)
 DELETE_DELAY=2.0
 
 # Dry run mode (Set to true to preview without deleting)
@@ -165,9 +169,28 @@ python discord_deleter.py --all-dms --dry-run
 | `--all-dms` | | Clean all sent messages across active open DMs |
 | `--deep-all-dms` | | Deep scan: includes hidden friends DMs with ultra-slow pacing |
 | `--yes` | `-y` | Auto-confirm all prompts without asking confirmation |
-| `--delay` | `-d` | Seconds between deletions (Default: `2.0s`) |
+| `--delay` | `-d` | Seconds between deletions (Default & enforced minimum: `2.0s`) |
 | `--dry-run` | | Preview messages without deleting |
 | `--help` | `-h` | Show help message and exit |
+
+---
+
+## Anti-Ban Safety Reference
+
+The following built-in protections are **always active** and require no configuration:
+
+| Protection Layer | Details |
+|---|---|
+| **Client Fingerprinting** | `X-Super-Properties`, `Sec-Ch-Ua-*`, `Sec-Fetch-*`, and 10+ headers mimicking a real Discord client |
+| **Wide Humanized Jitter** | `0.2–1.0s` random jitter on every request, plus 5% chance of a `1.5–4.0s` extra pause |
+| **Randomized Cooldowns** | `4–8s` pause every `12–25` deletions (both interval and duration are randomized) |
+| **Capped Retries** | Max `5` retries on rate-limits with escalating backoff (`+0.5–1.5s` per attempt) |
+| **Session Limit Warning** | Warning + `15–30s` forced pause at `500` deletions per session |
+| **Adaptive Delay** | Auto-increases delay on rate-limits (up to `8.0s`), slowly recovers after `20` smooth requests |
+| **Between-Target Rest** | `3–6s` rest between user queue items, `4–8s` rest between DM chats |
+| **Deep Scan Throttle** | `3–6s` per friend check, `2–4s` post-open rest during hidden DM discovery |
+
+> **Tip:** For maximum safety, use `--delay 3.0` or higher and avoid deleting more than 500 messages in a single session. Spread large deletions across multiple days.
 
 ---
 
@@ -175,9 +198,10 @@ python discord_deleter.py --all-dms --dry-run
 
 This tool is created solely for personal data management and privacy purposes (e.g. deleting your own past messages under GDPR/privacy rights). 
 
-- Automating user accounts (Self-Botting) is against Discord's Terms of Service.
+- **Automating user accounts (Self-Botting) is against Discord's Terms of Service.** No amount of delay or fingerprinting makes self-botting "allowed" — these protections only reduce the probability of automated detection.
 - Use this tool at your own discretion. The author and contributors are not responsible for any actions taken against your account (including rate limits, suspensions, or bans).
 - Always keep delays at recommended values (`>= 2.0s`) to minimize automated detection.
+- Consider using Discord's **official data request** (Settings → Privacy & Safety) for zero-risk message management.
 
 ---
 
