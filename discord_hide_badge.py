@@ -24,6 +24,7 @@ from urllib3.util.retry import Retry
 
 # Try importing discord_protos if available
 try:
+    # pyrefly: ignore [missing-import]
     from discord_protos import PreloadedUserSettings
     HAS_DISCORD_PROTOS = True
 except ImportError:
