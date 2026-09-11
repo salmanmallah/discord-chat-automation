@@ -1,3 +1,5 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
 colorama>=0.4.6
+discord-protos>=1.2.0
+protobuf>=4.24.0

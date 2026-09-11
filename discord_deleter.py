@@ -1,16 +1,19 @@
+import argparse
+import base64
+import getpass
+import json
+import os
+import random
+import re
 import sys
 import time
-import argparse
-import os
-import getpass
-import re
-import random
-import base64
-import json
-from typing import List, Dict, Any, Optional
+from typing import Any
+
 import requests
+from colorama import Fore, Style, init
 from dotenv import load_dotenv
-from colorama import init, Fore, Style
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Initialize colorama
 init(autoreset=True)
@@ -30,43 +33,116 @@ COOLDOWN_PAUSE_MAX = 8.0
 BASE_SCAN_DELAY = 1.8                 # Delay between channel scan pages
 BASE_SEARCH_DELAY = 2.5               # Delay between search API pages
 BASE_DELETE_DELAY = 2.0               # Minimum delay between deletions
-DEEP_SCAN_DELAY_MIN = 3.0             # Deep scan friend check delays
-DEEP_SCAN_DELAY_MAX = 6.0
-BETWEEN_CHAT_REST_MIN = 4.0           # Rest between different DM chats
+UNHIDE_PRE_DELAY = 5.0                # Delay in seconds BEFORE unhiding/opening a closed DM (Anti-Ban Guard)
+UNHIDE_POST_DELAY = 5.0               # Delay in seconds AFTER unhiding before scanning messages (Anti-Ban Guard)
+BETWEEN_UNHIDE_REST_MIN = 5.0         # Rest range between sequential unhide & delete chats
+BETWEEN_UNHIDE_REST_MAX = 8.0
+BETWEEN_CHAT_REST_MIN = 4.0           # Rest between different active DM chats
 BETWEEN_CHAT_REST_MAX = 8.0
-BETWEEN_USER_REST_MIN = 3.0           # Rest between user ID queue items
-BETWEEN_USER_REST_MAX = 6.0
+BETWEEN_USER_REST_MIN = 5.0           # Rest between user ID queue items
+BETWEEN_USER_REST_MAX = 8.0
+BETWEEN_GUILD_REST_MIN = 6.0          # Rest cooldown between sequential server (guild) deletions
+BETWEEN_GUILD_REST_MAX = 10.0
 
-def safe_sleep(seconds: float, jitter: float = 1.0):
-    """Sleeps with wide randomized human-like jitter to avoid automated bot detection patterns."""
-    jitter_amount = random.uniform(0.2, jitter)
-    actual_delay = max(0.5, seconds + jitter_amount)
-    # Occasionally add a longer "human thinking" pause (~5% chance) for realism
+# Non-blocking Keyboard Detection for Spacebar Skip (Windows standard library)
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
+
+# Global Skip Controller
+SKIP_ENABLED = False
+
+class SkipCurrentTargetException(Exception):
+    """Raised when user presses Spacebar to skip the current server or chat."""
+
+class TokenRevokedException(Exception):
+    """Raised when Discord API returns HTTP 401 (token invalidated/expired)."""
+
+def flush_key_buffer() -> None:
+    """Flushes buffered keystrokes to ensure previous keys do not cause unwanted skips."""
+    if HAS_MSVCRT:
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b'\x00', b'\xe0') and msvcrt.kbhit():
+                msvcrt.getch()
+
+def check_skip_pressed() -> bool:
+    """Checks non-blocking if Spacebar (or 's'/'S') was pressed, safely ignoring extended keycodes."""
+    if HAS_MSVCRT:
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b'\x00', b'\xe0'):
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                continue
+            if ch in (b' ', b's', b'S'):
+                return True
+    return False
+
+def enable_skip() -> None:
+    """Enables Spacebar skip listening for the current target and clears key buffer."""
+    global SKIP_ENABLED
+    flush_key_buffer()
+    SKIP_ENABLED = True
+
+def disable_skip() -> None:
+    """Disables Spacebar skip listening."""
+    global SKIP_ENABLED
+    SKIP_ENABLED = False
+
+def safe_sleep(seconds: float, jitter: float = 1.0) -> None:
+    """
+    Sleeps with randomized human-like jitter while remaining responsive to Spacebar skip key.
+    Checks keyboard input every 50ms so Spacebar reacts immediately.
+    """
+    jitter_amount = random.uniform(0.2, max(0.2, jitter))
+    actual_delay = max(0.2, seconds + jitter_amount)
     if random.random() < 0.05:
         actual_delay += random.uniform(1.5, 4.0)
-    time.sleep(actual_delay)
 
-def print_banner():
+    end_time = time.time() + actual_delay
+    while time.time() < end_time:
+        if SKIP_ENABLED and check_skip_pressed():
+            raise SkipCurrentTargetException("Skipped by user via Spacebar")
+        remaining = end_time - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, max(0.01, remaining)))
+
+def print_banner() -> None:
     print(f"\n{Fore.CYAN}+---------------------------------------------------------+{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}| {Fore.MAGENTA}          DISCORD AUTOMATED MESSAGE DELETER v2.0        {Fore.CYAN}|{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}| {Fore.MAGENTA}          DISCORD AUTOMATED MESSAGE DELETER v2.2        {Fore.CYAN}|{Style.RESET_ALL}")
     print(f"{Fore.CYAN}| {Fore.YELLOW}       [ Server Guilds & Personal DMs Automation ]       {Fore.CYAN}|{Style.RESET_ALL}")
     print(f"{Fore.CYAN}| {Fore.GREEN}        (Enhanced Anti-Ban & Rate-Limit Shield)          {Fore.CYAN}|{Style.RESET_ALL}")
     print(f"{Fore.CYAN}+---------------------------------------------------------+{Style.RESET_ALL}\n")
 
-def log_info(msg: str):
+def log_info(msg: str) -> None:
     print(f"{Fore.CYAN}[*]{Style.RESET_ALL} {msg}")
 
-def log_success(msg: str):
+def log_success(msg: str) -> None:
     print(f"{Fore.GREEN}[+]{Style.RESET_ALL} {msg}")
 
-def log_warn(msg: str):
+def log_warn(msg: str) -> None:
     print(f"{Fore.YELLOW}[!]{Style.RESET_ALL} {msg}")
 
-def log_error(msg: str):
+def log_error(msg: str) -> None:
     print(f"{Fore.RED}[-]{Style.RESET_ALL} {msg}")
 
-def get_headers(token: str) -> Dict[str, str]:
+def extract_retry_after(response: requests.Response, default: float = 2.0) -> float:
+    """Safely extracts retry_after duration from a Discord rate limit response."""
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            return float(data.get("retry_after", default))
+    except (ValueError, requests.RequestException, AttributeError):
+        pass
+    return default
+
+def get_headers(token: str) -> dict[str, str]:
     """Returns HTTP headers mimicking a real Discord client to reduce detection risk."""
+    clean_token = token.strip().strip('"').strip("'")
     super_properties = base64.b64encode(json.dumps({
         "os": "Windows",
         "browser": "Chrome",
@@ -85,7 +161,7 @@ def get_headers(token: str) -> Dict[str, str]:
     }, separators=(',', ':')).encode()).decode()
 
     return {
-        "Authorization": token.strip(),
+        "Authorization": clean_token,
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "X-Super-Properties": super_properties,
@@ -102,10 +178,27 @@ def get_headers(token: str) -> Dict[str, str]:
         "Sec-Fetch-Site": "same-origin",
     }
 
-def verify_token(headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+def create_session(token: str) -> requests.Session:
+    """Creates a persistent requests.Session with connection pooling, keep-alive, and browser headers."""
+    session = requests.Session()
+    headers = get_headers(token)
+    session.headers.update(headers)
+    retries = Retry(
+        total=3,
+        connect=3,
+        backoff_factor=0.3,
+        status_forcelist=[502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=25, max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+def verify_token(session: requests.Session) -> dict[str, Any] | None:
     """Verifies the authorization token and returns user details."""
     try:
-        res = requests.get(f"{DISCORD_API_BASE}/users/@me", headers=headers, timeout=10)
+        res = session.get(f"{DISCORD_API_BASE}/users/@me", timeout=12)
         if res.status_code == 200:
             return res.json()
         elif res.status_code == 401:
@@ -114,14 +207,15 @@ def verify_token(headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
         else:
             log_error(f"Authentication failed. HTTP {res.status_code}: {res.text}")
             return None
-    except Exception as e:
+    except requests.RequestException as e:
         log_error(f"Network error during authentication check: {e}")
         return None
 
-def fetch_user_guilds(headers: Dict[str, str]) -> List[Dict[str, Any]]:
+def fetch_user_guilds(session: requests.Session) -> list[dict[str, Any]]:
     """Fetches all Discord servers (guilds) joined by the user with rate limit protection."""
-    guilds = []
+    guilds: list[dict[str, Any]] = []
     after = None
+    consecutive_rate_limits = 0
     
     while True:
         url = f"{DISCORD_API_BASE}/users/@me/guilds?limit=100"
@@ -129,8 +223,9 @@ def fetch_user_guilds(headers: Dict[str, str]) -> List[Dict[str, Any]]:
             url += f"&after={after}"
             
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = session.get(url, timeout=12)
             if res.status_code == 200:
+                consecutive_rate_limits = 0
                 batch = res.json()
                 if not batch:
                     break
@@ -140,25 +235,36 @@ def fetch_user_guilds(headers: Dict[str, str]) -> List[Dict[str, Any]]:
                 after = batch[-1]["id"]
                 safe_sleep(1.5, 0.8)
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.0))
-                log_warn(f"Rate limited while fetching servers. Waiting {retry + 1.5:.2f}s...")
-                safe_sleep(retry + 1.5)
+                consecutive_rate_limits += 1
+                if consecutive_rate_limits > MAX_API_RETRIES:
+                    log_error(f"Exceeded max retries ({MAX_API_RETRIES}) fetching servers.")
+                    break
+                retry = extract_retry_after(res, 2.0)
+                backoff = retry + 1.5 + (consecutive_rate_limits * 1.0)
+                log_warn(f"Rate limited while fetching servers (attempt {consecutive_rate_limits}/{MAX_API_RETRIES}). Waiting {backoff:.2f}s...")
+                safe_sleep(backoff, 1.5)
+            elif res.status_code == 401:
+                raise TokenRevokedException("Discord token expired or revoked.")
             else:
                 log_error(f"Failed to fetch servers. HTTP {res.status_code}: {res.text}")
                 break
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_error(f"Error fetching servers: {e}")
             break
             
     return guilds
 
-def select_guild_server(headers: Dict[str, str]) -> Optional[str]:
-    """Interactively lists joined Discord servers and lets the user pick one."""
+def select_guild_server(session: requests.Session) -> str | None:
+    """Interactively lists joined Discord servers and lets the user pick one, enter an ID, or select ALL servers."""
     log_info("Fetching your joined Discord Servers (Guilds)...")
-    guilds = fetch_user_guilds(headers)
+    guilds = fetch_user_guilds(session)
     
     print(f"\n{Fore.GREEN}Select a Discord Server:{Style.RESET_ALL}")
     print(f"  {Fore.YELLOW}[0]{Style.RESET_ALL} Enter Server (Guild) ID manually")
+    if guilds:
+        print(f"  {Fore.CYAN}[A]{Style.RESET_ALL} Delete sent messages across {Fore.GREEN}ALL {len(guilds)} Servers / Groups{Style.RESET_ALL} (Queue with Cooldown)")
     
     guild_options = []
     for idx, g in enumerate(guilds, 1):
@@ -170,7 +276,9 @@ def select_guild_server(headers: Dict[str, str]) -> Optional[str]:
         print(f"  {Fore.YELLOW}[{idx}]{Style.RESET_ALL} {g_name}{is_owner} (ID: {g_id})")
 
     try:
-        choice = input(f"\n{Fore.GREEN}Choose option [0-{len(guild_options)}]: {Style.RESET_ALL}").strip()
+        choice = input(f"\n{Fore.GREEN}Choose option [0-{len(guild_options)}, or 'A' for all groups]: {Style.RESET_ALL}").strip()
+        if choice.lower() in ("a", "all"):
+            return "ALL"
         if choice == "0":
             return input(f"{Fore.YELLOW}Enter Server ID manually: {Style.RESET_ALL}").strip()
         
@@ -189,102 +297,73 @@ def select_guild_server(headers: Dict[str, str]) -> Optional[str]:
         log_info("\nCancelled by user.")
         return None
 
-def fetch_user_dms(headers: Dict[str, str]) -> List[Dict[str, Any]]:
+def fetch_user_dms(session: requests.Session) -> list[dict[str, Any]]:
     """Fetches user's active DM channels with rate-limit handling and retry cap."""
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
-            res = requests.get(f"{DISCORD_API_BASE}/users/@me/channels", headers=headers, timeout=10)
+            res = session.get(f"{DISCORD_API_BASE}/users/@me/channels", timeout=12)
             if res.status_code == 200:
                 return res.json()
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.0))
+                retry = extract_retry_after(res, 2.0)
                 backoff = retry + 1.5 + (attempt * 1.0)
                 log_warn(f"Rate limited while fetching DMs (attempt {attempt}/{MAX_API_RETRIES}). Waiting {backoff:.2f}s...")
                 safe_sleep(backoff, 1.5)
+            elif res.status_code == 401:
+                raise TokenRevokedException("Discord token expired or revoked.")
             else:
                 log_error(f"Failed to fetch DMs. HTTP {res.status_code}: {res.text}")
                 return []
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_error(f"Error fetching DMs: {e}")
             return []
     log_error(f"Exceeded max retries ({MAX_API_RETRIES}) fetching DMs.")
     return []
 
-def fetch_user_relationships(headers: Dict[str, str]) -> List[Dict[str, Any]]:
+def fetch_user_relationships(session: requests.Session) -> list[dict[str, Any]]:
     """Fetches user's friends and relationships with rate-limit protection and retry cap."""
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
-            res = requests.get(f"{DISCORD_API_BASE}/users/@me/relationships", headers=headers, timeout=10)
+            res = session.get(f"{DISCORD_API_BASE}/users/@me/relationships", timeout=12)
             if res.status_code == 200:
                 return res.json()
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.0))
+                retry = extract_retry_after(res, 2.0)
                 backoff = retry + 2.5 + (attempt * 1.5)
                 log_warn(f"Rate limited on relationships (attempt {attempt}/{MAX_API_RETRIES}). Waiting {backoff:.2f}s...")
                 safe_sleep(backoff, 2.0)
+            elif res.status_code == 401:
+                raise TokenRevokedException("Discord token expired or revoked.")
             else:
                 return []
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_warn(f"Could not fetch relationships: {e}")
             return []
     log_error(f"Exceeded max retries ({MAX_API_RETRIES}) fetching relationships.")
     return []
 
-def discover_all_dm_chats(headers: Dict[str, str], include_hidden: bool = False) -> List[Dict[str, Any]]:
-    """
-    Discovers all Personal DM and Group chats.
-    If include_hidden is True, slowly checks account relationships/friends with 2.5s - 4.5s delays.
-    """
-    all_dms: Dict[str, Dict[str, Any]] = {}
-    known_recipients = set()
+def discover_all_dm_chats(session: requests.Session) -> list[dict[str, Any]]:
+    """Discovers all currently active Personal DM and Group chats safely without opening closed DMs."""
+    all_dms: dict[str, dict[str, Any]] = {}
     
-    # 1. Fetch active open DMs
     log_info("Fetching active Personal DM & Group chats...")
-    active_dms = fetch_user_dms(headers)
+    active_dms = fetch_user_dms(session)
     for dm in active_dms:
         dm_id = dm.get("id")
         if dm_id:
             all_dms[dm_id] = dm
-            for r in dm.get("recipients", []):
-                known_recipients.add(r.get("id"))
 
     log_info(f"Found {Fore.YELLOW}{len(all_dms)}{Style.RESET_ALL} active/open DM chat(s).")
-
-    # 2. If Deep Scan is requested, safely check relationships with large delays
-    if include_hidden:
-        relationships = fetch_user_relationships(headers)
-        if relationships:
-            log_info(f"Checking {len(relationships)} friends/relationships for closed DMs with ultra-slow human delays (2.5s - 4.5s)...")
-            
-            for idx, rel in enumerate(relationships, 1):
-                user_obj = rel.get("user", {})
-                u_id = user_obj.get("id")
-                u_name = user_obj.get("username", "Unknown")
-                
-                if u_id and u_id not in known_recipients:
-                    print(f"[{idx}/{len(relationships)}] Checking friend @{u_name} (ID: {u_id}) ... ", end="", flush=True)
-                    
-                    # Humanized pause before checking/unhiding DM (ultra-slow: 3-6s)
-                    safe_sleep(random.uniform(DEEP_SCAN_DELAY_MIN, DEEP_SCAN_DELAY_MAX), 2.0)
-                    
-                    dm_data = get_or_create_dm_by_user_id(headers, u_id)
-                    if dm_data and dm_data.get("id"):
-                        all_dms[dm_data["id"]] = dm_data
-                        known_recipients.add(u_id)
-                        print(f"{Fore.GREEN}DM Available{Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.YELLOW}Skipped{Style.RESET_ALL}")
-                    
-                    # Humanized pause after opening (2-4s)
-                    safe_sleep(random.uniform(2.0, 4.0), 1.5)
-
-    log_success(f"Total DM chats ready in queue: {Fore.YELLOW}{len(all_dms)}{Style.RESET_ALL}")
     return list(all_dms.values())
 
-def select_dm_channel(headers: Dict[str, str]) -> Optional[str]:
+def select_dm_channel(session: requests.Session) -> str | None:
     """Interactively lists DMs and lets the user pick one or type a Channel ID."""
     log_info("Fetching your active Direct Messages (DMs)...")
-    dms = fetch_user_dms(headers)
+    dms = fetch_user_dms(session)
     
     print(f"\n{Fore.GREEN}Select a DM Chat:{Style.RESET_ALL}")
     print(f"  {Fore.YELLOW}[0]{Style.RESET_ALL} Enter DM Channel ID manually")
@@ -325,7 +404,7 @@ def select_dm_channel(headers: Dict[str, str]) -> Optional[str]:
         log_info("\nCancelled by user.")
         return None
 
-def get_or_create_dm_by_user_id(headers: Dict[str, str], target_user_id: str) -> Optional[Dict[str, Any]]:
+def get_or_create_dm_by_user_id(session: requests.Session, target_user_id: str) -> dict[str, Any] | None:
     """Opens or retrieves an existing DM channel with a target user by User ID with rate-limit safety and retry cap."""
     target_user_id = target_user_id.strip()
     if not target_user_id:
@@ -337,7 +416,7 @@ def get_or_create_dm_by_user_id(headers: Dict[str, str], target_user_id: str) ->
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
             payload = {"recipient_id": target_user_id}
-            res = requests.post(f"{DISCORD_API_BASE}/users/@me/channels", headers=headers, json=payload, timeout=10)
+            res = session.post(f"{DISCORD_API_BASE}/users/@me/channels", json=payload, timeout=12)
             
             if res.status_code in (200, 201):
                 dm_data = res.json()
@@ -346,124 +425,169 @@ def get_or_create_dm_by_user_id(headers: Dict[str, str], target_user_id: str) ->
                 log_success(f"Located DM channel with: {Fore.GREEN}{recipient_name}{Style.RESET_ALL} (Channel ID: {dm_data.get('id')})")
                 return dm_data
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.0))
+                retry = extract_retry_after(res, 2.0)
                 backoff = retry + 2.0 + (attempt * 1.5)
                 log_warn(f"Rate limited while opening DM (attempt {attempt}/{MAX_API_RETRIES}). Waiting {backoff:.2f}s...")
                 safe_sleep(backoff, 2.0)
             elif res.status_code == 400:
                 log_error(f"Cannot open DM with User ID {target_user_id}. (Invalid User ID or self-DM not allowed)")
                 return None
+            elif res.status_code == 401:
+                raise TokenRevokedException("Discord token expired or revoked.")
             elif res.status_code == 403:
                 log_error(f"Cannot open DM with User ID {target_user_id}. (DMs closed or blocked by user)")
                 return None
             else:
                 log_error(f"Failed to open DM. HTTP {res.status_code}: {res.text}")
                 return None
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_error(f"Error resolving DM channel by User ID: {e}")
             return None
 
     log_error(f"Exceeded max retries ({MAX_API_RETRIES}) opening DM with User ID {target_user_id}.")
     return None
 
-def fetch_guild_channels(headers: Dict[str, str], guild_id: str) -> List[Dict[str, Any]]:
+def close_dm_channel(session: requests.Session, channel_id: str) -> bool:
+    """Closes / re-hides an open DM channel so it does not clutter the user's Discord client sidebar."""
+    try:
+        res = session.delete(f"{DISCORD_API_BASE}/channels/{channel_id}", timeout=10)
+        return res.status_code in (200, 204)
+    except requests.RequestException:
+        return False
+
+def fetch_guild_channels(session: requests.Session, guild_id: str) -> list[dict[str, Any]]:
     """Fetches text channels in a guild with rate-limit protection and retry cap."""
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
-            res = requests.get(f"{DISCORD_API_BASE}/guilds/{guild_id}/channels", headers=headers, timeout=10)
+            res = session.get(f"{DISCORD_API_BASE}/guilds/{guild_id}/channels", timeout=12)
             if res.status_code == 200:
                 channels = res.json()
-                # Types: 0=Text, 2=Voice, 5=Announcement, 15=Forum
-                return [c for c in channels if c.get("type") in (0, 2, 5, 15)]
+                # Types: 0=Text, 2=Voice (with text chat), 5=Announcement
+                return [c for c in channels if c.get("type") in (0, 2, 5)]
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.0))
+                retry = extract_retry_after(res, 2.0)
                 backoff = retry + 1.5 + (attempt * 1.0)
                 log_warn(f"Rate limited while fetching channels (attempt {attempt}/{MAX_API_RETRIES}). Retrying in {backoff:.2f}s...")
                 safe_sleep(backoff, 1.5)
+            elif res.status_code == 401:
+                raise TokenRevokedException("Discord token expired or revoked.")
             else:
                 log_error(f"Failed to fetch guild channels. HTTP {res.status_code}: {res.text}")
                 return []
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_error(f"Error fetching guild channels: {e}")
             return []
     log_error(f"Exceeded max retries ({MAX_API_RETRIES}) fetching guild channels.")
     return []
 
-def search_guild_user_messages(headers: Dict[str, str], guild_id: str, user_id: str) -> List[Dict[str, Any]]:
+def search_guild_user_messages(session: requests.Session, guild_id: str, user_id: str) -> list[dict[str, Any]]:
     """Uses Discord Guild Search API to find messages sent by the user across the entire guild."""
     log_info(f"Searching for your messages across server (Guild ID: {guild_id})...")
-    messages = []
+    messages: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     offset = 0
+    consecutive_rate_limits = 0
     
     while True:
+        if offset >= 5000:
+            log_warn(f"Reached Discord Search API maximum indexing limit (5000 messages). Continuing with {len(messages)} collected messages.")
+            break
+
         url = f"{DISCORD_API_BASE}/guilds/{guild_id}/messages/search?author_id={user_id}&offset={offset}"
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = session.get(url, timeout=12)
             if res.status_code == 200:
+                consecutive_rate_limits = 0
                 data = res.json()
                 total_results = data.get("total_results", 0)
                 msg_groups = data.get("messages", [])
                 
                 if offset == 0:
                     log_info(f"Total messages found in server search index: {Fore.YELLOW}{total_results}{Style.RESET_ALL}")
+                    if total_results > 5000:
+                        log_warn(f"Note: Server has {total_results} indexed messages. Discord API allows searching up to 5,000 per query.")
 
                 if not msg_groups:
                     break
 
                 for group in msg_groups:
                     for msg in group:
-                        if msg.get("author", {}).get("id") == user_id:
-                            if not any(m["id"] == msg["id"] for m in messages):
-                                messages.append({
-                                    "id": msg["id"],
-                                    "channel_id": msg["channel_id"],
-                                    "content": msg.get("content", ""),
-                                    "timestamp": msg.get("timestamp", "")
-                                })
+                        msg_id = msg.get("id")
+                        if msg_id and msg.get("author", {}).get("id") == user_id and msg_id not in seen_ids:
+                            seen_ids.add(msg_id)
+                            messages.append({
+                                "id": msg_id,
+                                "channel_id": msg["channel_id"],
+                                "content": msg.get("content", ""),
+                                "timestamp": msg.get("timestamp", "")
+                            })
 
                 offset += 25
                 safe_sleep(BASE_SEARCH_DELAY, 1.0)
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.5))
-                backoff = retry + 3.0
-                log_warn(f"Search API Rate limited. Waiting {backoff:.2f} seconds...")
+                consecutive_rate_limits += 1
+                if consecutive_rate_limits > MAX_API_RETRIES:
+                    log_error(f"Exceeded max consecutive rate limits ({MAX_API_RETRIES}) on Search API. Halting search.")
+                    break
+                retry = extract_retry_after(res, 2.5)
+                backoff = retry + 3.0 + (consecutive_rate_limits * 1.0)
+                log_warn(f"Search API Rate limited (attempt {consecutive_rate_limits}/{MAX_API_RETRIES}). Waiting {backoff:.2f} seconds...")
                 safe_sleep(backoff, 2.0)
             elif res.status_code == 202:
                 log_warn("Discord is indexing messages for this server. Retrying in 8s...")
                 safe_sleep(8.0, 2.0)
+            elif res.status_code == 400 and offset >= 5000:
+                log_warn(f"Search API maximum offset limit reached. Processed {len(messages)} messages.")
+                break
+            elif res.status_code == 401:
+                raise TokenRevokedException("Discord token expired or revoked.")
             else:
                 log_warn(f"Guild Search API failed or disabled (HTTP {res.status_code}). Falling back to channel scan.")
                 break
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_error(f"Error calling Search API: {e}")
             break
             
     return messages
 
-def scan_channel_user_messages(headers: Dict[str, str], channel_id: str, user_id: str, label: str = "channel") -> List[Dict[str, Any]]:
+def scan_channel_user_messages(session: requests.Session, channel_id: str, user_id: str, label: str = "channel") -> list[dict[str, Any]]:
     """Scans history of a single channel (Guild Channel or DM) for messages by user_id with safe pacing."""
     log_info(f"Scanning message history in {label} (ID: {channel_id})...")
-    messages = []
+    messages: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     before = None
     scanned_count = 0
+    consecutive_rate_limits = 0
     
     while True:
+        if SKIP_ENABLED and check_skip_pressed():
+            raise SkipCurrentTargetException("Skipped by user via Spacebar")
+
         url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages?limit=100"
         if before:
             url += f"&before={before}"
 
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = session.get(url, timeout=12)
             if res.status_code == 200:
+                consecutive_rate_limits = 0
                 batch = res.json()
                 if not batch:
                     break
                 
                 scanned_count += len(batch)
                 for msg in batch:
-                    if msg.get("author", {}).get("id") == user_id:
+                    msg_id = msg.get("id")
+                    if msg_id and msg.get("author", {}).get("id") == user_id and msg_id not in seen_ids:
+                        seen_ids.add(msg_id)
                         messages.append({
-                            "id": msg["id"],
+                            "id": msg_id,
                             "channel_id": channel_id,
                             "content": msg.get("content", ""),
                             "timestamp": msg.get("timestamp", "")
@@ -473,21 +597,33 @@ def scan_channel_user_messages(headers: Dict[str, str], channel_id: str, user_id
                 print(f"\r{Fore.CYAN}[*]{Style.RESET_ALL} Scanned {scanned_count} messages, found {len(messages)} matching...", end="", flush=True)
                 safe_sleep(BASE_SCAN_DELAY, 0.8)
             elif res.status_code == 429:
-                retry = float(res.json().get("retry_after", 2.0))
-                backoff = retry + 2.5
-                log_warn(f"\nRate limited during message scan. Waiting {backoff:.2f}s...")
+                consecutive_rate_limits += 1
+                if consecutive_rate_limits > MAX_API_RETRIES:
+                    log_error(f"\nExceeded max consecutive rate limits ({MAX_API_RETRIES}) scanning channel. Halting channel scan.")
+                    break
+                retry = extract_retry_after(res, 2.0)
+                backoff = retry + 2.5 + (consecutive_rate_limits * 1.0)
+                log_warn(f"\nRate limited during message scan (attempt {consecutive_rate_limits}/{MAX_API_RETRIES}). Waiting {backoff:.2f}s...")
                 safe_sleep(backoff, 1.5)
+            elif res.status_code == 401:
+                log_error("Discord User Token was revoked, expired, or logged out! (HTTP 401 Unauthorized)")
+                raise TokenRevokedException("Discord token expired or revoked.")
+            elif res.status_code == 403:
+                log_error(f"Cannot access channel {channel_id} (Missing Permissions).")
+                break
             else:
                 log_error(f"Failed to scan channel. HTTP {res.status_code}: {res.text}")
                 break
-        except Exception as e:
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
             log_error(f"Error scanning channel {channel_id}: {e}")
             break
 
     print()
     return messages
 
-def delete_message(headers: Dict[str, str], channel_id: str, message_id: str) -> tuple[bool, bool]:
+def delete_message(session: requests.Session, channel_id: str, message_id: str) -> tuple[bool, bool]:
     """
     Sends DELETE request for a single message and handles rate limits safely with retry cap.
     Returns (success: bool, hit_rate_limit: bool)
@@ -497,38 +633,38 @@ def delete_message(headers: Dict[str, str], channel_id: str, message_id: str) ->
     
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
-            res = requests.delete(url, headers=headers, timeout=10)
+            res = session.delete(url, timeout=12)
             if res.status_code == 204:
                 return True, hit_rate_limit
             elif res.status_code == 429:
                 hit_rate_limit = True
-                data = {}
-                try:
-                    data = res.json()
-                except Exception:
-                    pass
-                retry = float(data.get("retry_after", 1.8))
+                retry = extract_retry_after(res, 1.8)
                 backoff = retry + 1.5 + (attempt * 0.5)
                 log_warn(f"Rate limited by Discord (attempt {attempt}/{MAX_API_RETRIES}). Waiting {backoff:.2f}s...")
                 safe_sleep(backoff, 1.5)
             elif res.status_code in (404, 200):
                 return True, hit_rate_limit
+            elif res.status_code == 401:
+                log_error("Discord User Token was revoked, expired, or logged out! (HTTP 401 Unauthorized)")
+                raise TokenRevokedException("Discord token expired or revoked.")
             elif res.status_code == 403:
                 log_error(f"Missing permissions to delete message {message_id}")
                 return False, hit_rate_limit
             else:
                 log_error(f"Failed to delete message {message_id}. HTTP {res.status_code}: {res.text}")
                 return False, hit_rate_limit
-        except Exception as e:
-            log_error(f"Exception during deletion: {e}")
+        except (SkipCurrentTargetException, TokenRevokedException):
+            raise
+        except requests.RequestException as e:
+            log_error(f"Network error during deletion: {e}")
             return False, hit_rate_limit
     
     log_error(f"Exceeded max retries ({MAX_API_RETRIES}) deleting message {message_id}.")
     return False, hit_rate_limit
 
 def delete_message_batch(
-    headers: Dict[str, str],
-    messages_to_delete: List[Dict[str, Any]],
+    session: requests.Session,
+    messages_to_delete: list[dict[str, Any]],
     base_delay: float = 2.0,
     dry_run: bool = False
 ) -> tuple[int, int]:
@@ -555,9 +691,12 @@ def delete_message_batch(
 
     try:
         for idx, msg in enumerate(messages_to_delete, 1):
+            if SKIP_ENABLED and check_skip_pressed():
+                raise SkipCurrentTargetException("Skipped by user via Spacebar")
+
             msg_id = msg["id"]
             ch_id = msg["channel_id"]
-            content = msg["content"]
+            content = msg.get("content", "")
             preview = (content[:40] + "...") if len(content) > 40 else content
             preview = preview.replace("\n", " ")
 
@@ -566,7 +705,7 @@ def delete_message_batch(
                 deleted_count += 1
             else:
                 print(f"[{idx}/{total_msgs}] Deleting Msg ID {msg_id}: '{preview}' ... ", end="", flush=True)
-                success, hit_rl = delete_message(headers, ch_id, msg_id)
+                success, hit_rl = delete_message(session, ch_id, msg_id)
                 if success:
                     print(f"{Fore.GREEN}DELETED{Style.RESET_ALL}")
                     deleted_count += 1
@@ -601,18 +740,20 @@ def delete_message_batch(
                     log_info("Taking extended 15-30s safety cooldown...")
                     safe_sleep(random.uniform(15.0, 30.0), 5.0)
 
+    except (SkipCurrentTargetException, TokenRevokedException):
+        raise
     except KeyboardInterrupt:
         log_warn("\nDeletion interrupted by user (Ctrl+C).")
 
     return deleted_count, failed_count
 
 def process_bulk_user_queue(
-    headers: Dict[str, str],
-    user_ids: List[str],
+    session: requests.Session,
+    user_ids: list[str],
     my_user_id: str,
     base_delay: float,
     dry_run: bool
-):
+) -> None:
     """Processes a queue of User IDs sequentially with safe pacing."""
     total_users = len(user_ids)
     log_info(f"Initialized Deletion Queue with {Fore.YELLOW}{total_users}{Style.RESET_ALL} User(s):")
@@ -627,35 +768,50 @@ def process_bulk_user_queue(
     for idx, uid in enumerate(user_ids, 1):
         print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
         print(f"{Fore.MAGENTA}  QUEUE [{idx}/{total_users}] -> Processing User ID: {Fore.YELLOW}{uid}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  Tip: Press [SPACE] at any time to skip this user and move to next!{Style.RESET_ALL}")
         print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
 
-        dm_data = get_or_create_dm_by_user_id(headers, uid)
-        if not dm_data:
-            log_error(f"Skipping User ID {uid} (Cannot open DM).")
-            user_results.append((uid, "Failed to open DM", 0, 0, 0))
-            continue
+        enable_skip()
+        try:
+            # Anti-Ban Guard: 5-second delay BEFORE unhiding/resolving DM
+            log_info(f"Pausing {UNHIDE_PRE_DELAY:.1f}s before resolving/unhiding DM with User ID {uid}...")
+            safe_sleep(UNHIDE_PRE_DELAY, 1.5)
 
-        ch_id = dm_data.get("id")
-        recipients = dm_data.get("recipients", [])
-        recipient_name = recipients[0].get("username", uid) if recipients else uid
+            dm_data = get_or_create_dm_by_user_id(session, uid)
+            if not dm_data:
+                log_error(f"Skipping User ID {uid} (Cannot open DM).")
+                user_results.append((uid, "Failed to open DM", 0, 0, 0))
+                continue
 
-        msgs = scan_channel_user_messages(headers, ch_id, my_user_id, label=f"DM with @{recipient_name}")
-        total_msgs = len(msgs)
+            # Anti-Ban Guard: 5-second delay AFTER unhiding before scanning messages
+            log_info(f"Pausing {UNHIDE_POST_DELAY:.1f}s after unhide before scanning message history...")
+            safe_sleep(UNHIDE_POST_DELAY, 1.5)
 
-        if total_msgs == 0:
-            log_warn(f"No messages sent by you found in chat with @{recipient_name}.")
-            user_results.append((uid, f"@{recipient_name}", 0, 0, 0))
-            continue
+            ch_id = dm_data.get("id")
+            recipients = dm_data.get("recipients", [])
+            recipient_name = recipients[0].get("username", uid) if recipients else uid
 
-        log_success(f"Found {Fore.YELLOW}{total_msgs}{Style.RESET_ALL} sent messages in chat with @{recipient_name}. Deleting now...")
+            msgs = scan_channel_user_messages(session, ch_id, my_user_id, label=f"DM with @{recipient_name}")
+            total_msgs = len(msgs)
 
-        del_cnt, fail_cnt = delete_message_batch(headers, msgs, base_delay, dry_run)
-        grand_total_found += total_msgs
-        grand_total_deleted += del_cnt
-        grand_total_failed += fail_cnt
-        user_results.append((uid, f"@{recipient_name}", total_msgs, del_cnt, fail_cnt))
+            if total_msgs == 0:
+                log_warn(f"No messages sent by you found in chat with @{recipient_name}.")
+                user_results.append((uid, f"@{recipient_name}", 0, 0, 0))
+            else:
+                log_success(f"Found {Fore.YELLOW}{total_msgs}{Style.RESET_ALL} sent messages in chat with @{recipient_name}. Deleting now...")
+                del_cnt, fail_cnt = delete_message_batch(session, msgs, base_delay, dry_run)
+                grand_total_found += total_msgs
+                grand_total_deleted += del_cnt
+                grand_total_failed += fail_cnt
+                user_results.append((uid, f"@{recipient_name}", total_msgs, del_cnt, fail_cnt))
 
-        # Rest between users in queue
+        except SkipCurrentTargetException:
+            print(f"\n{Fore.YELLOW}[>>] [SPACE] pressed! Skipped user ID: {Fore.CYAN}{uid}{Fore.YELLOW} -> Moving to next user...{Style.RESET_ALL}")
+            user_results.append((uid, f"User {uid} (Skipped)", 0, 0, 0))
+        finally:
+            disable_skip()
+
+        # Rest between users in queue (5s - 8s)
         if idx < total_users:
             rest_time = random.uniform(BETWEEN_USER_REST_MIN, BETWEEN_USER_REST_MAX)
             log_info(f"Resting {rest_time:.1f}s before moving to next user in queue...")
@@ -678,64 +834,161 @@ def process_bulk_user_queue(
     print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}\n")
 
 def process_all_dms_queue(
-    headers: Dict[str, str],
+    session: requests.Session,
     my_user_id: str,
     base_delay: float,
     dry_run: bool,
     include_hidden: bool = False
-):
-    """Discovers Personal DMs (with optional ultra-slow hidden scan) and deletes sent messages in queue."""
-    dm_list = discover_all_dm_chats(headers, include_hidden=include_hidden)
+) -> None:
+    """
+    Processes Personal DMs with anti-ban sequential workflow:
+    - Phase 1: Cleans currently active open DMs (safe, no unhiding needed).
+    - Phase 2 (Optional Deep Scan): Unhides 1 closed friend DM -> 5s delay -> Deletes its messages -> 5s rest -> Next friend.
+    """
+    # ── PHASE 1: Active Open DMs ──
+    dm_list = discover_all_dm_chats(session)
     total_chats = len(dm_list)
-    
-    if total_chats == 0:
-        log_warn("No DM chats found on this account.")
-        return
-
-    log_info(f"Starting automatic queue deletion across {Fore.YELLOW}{total_chats}{Style.RESET_ALL} DM chat(s)... (Safe Paced)")
+    known_recipients = set()
 
     grand_total_found = 0
     grand_total_deleted = 0
     grand_total_failed = 0
     chat_results = []
 
-    for idx, dm in enumerate(dm_list, 1):
-        dm_id = dm.get("id")
-        dm_type = dm.get("type")
-        recipients = dm.get("recipients", [])
+    if total_chats > 0:
+        log_info(f"Starting automatic queue deletion across {Fore.YELLOW}{total_chats}{Style.RESET_ALL} Active Open DM chat(s)... (Safe Paced)")
 
-        if dm_type == 1 and recipients:
-            name = f"@{recipients[0].get('username', 'Unknown')}"
-        elif dm_type == 3:
-            name = "Group: " + ", ".join([r.get("username", "") for r in recipients[:3]])
+        for idx, dm in enumerate(dm_list, 1):
+            dm_id = dm.get("id")
+            dm_type = dm.get("type")
+            recipients = dm.get("recipients", [])
+            for r in recipients:
+                if r.get("id"):
+                    known_recipients.add(r["id"])
+
+            if dm_type == 1 and recipients:
+                name = f"@{recipients[0].get('username', 'Unknown')}"
+            elif dm_type == 3:
+                name = "Group: " + ", ".join([r.get("username", "") for r in recipients[:3]])
+            else:
+                name = f"DM ({dm_id})"
+
+            print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+            print(f"{Fore.MAGENTA}  ACTIVE DM [{idx}/{total_chats}] -> Chat: {Fore.YELLOW}{name}{Fore.MAGENTA} (ID: {dm_id}){Style.RESET_ALL}")
+            print(f"{Fore.CYAN}  Tip: Press [SPACE] at any time to skip this chat and move to next!{Style.RESET_ALL}")
+            print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+
+            enable_skip()
+            try:
+                msgs = scan_channel_user_messages(session, dm_id, my_user_id, label=name)
+                total_msgs = len(msgs)
+
+                if total_msgs == 0:
+                    log_info(f"No sent messages found in {name}. Continuing...")
+                    chat_results.append((dm_id, name, 0, 0, 0))
+                else:
+                    log_success(f"Found {Fore.YELLOW}{total_msgs}{Style.RESET_ALL} sent messages in {name}. Deleting now...")
+                    del_cnt, fail_cnt = delete_message_batch(session, msgs, base_delay, dry_run)
+                    grand_total_found += total_msgs
+                    grand_total_deleted += del_cnt
+                    grand_total_failed += fail_cnt
+                    chat_results.append((dm_id, name, total_msgs, del_cnt, fail_cnt))
+            except SkipCurrentTargetException:
+                print(f"\n{Fore.YELLOW}[>>] [SPACE] pressed! Skipped chat: {Fore.CYAN}{name}{Fore.YELLOW} -> Moving to next chat...{Style.RESET_ALL}")
+                chat_results.append((dm_id, f"{name} (Skipped)", 0, 0, 0))
+            finally:
+                disable_skip()
+
+            # Rest between active chats in queue (4s - 8s)
+            if idx < total_chats:
+                rest_time = random.uniform(BETWEEN_CHAT_REST_MIN, BETWEEN_CHAT_REST_MAX)
+                log_info(f"Resting {rest_time:.1f}s before moving to next DM chat in queue...")
+                safe_sleep(rest_time, 2.0)
+    else:
+        log_warn("No currently active/open DM chats found.")
+
+    # ── PHASE 2: Safe Sequential Unhide for Hidden Friends DMs ──
+    if include_hidden:
+        print(f"\n{Fore.CYAN}====================================================={Style.RESET_ALL}")
+        print(f"{Fore.CYAN}    PHASE 2: SAFE 1-BY-1 HIDDEN FRIENDS DM CLEANUP   {Style.RESET_ALL}")
+        print(f"{Fore.CYAN}====================================================={Style.RESET_ALL}")
+        log_info("Fetching friends/relationships to check for closed DMs...")
+        relationships = fetch_user_relationships(session)
+
+        friends_to_check = []
+        if relationships:
+            for rel in relationships:
+                u_obj = rel.get("user", {})
+                f_id = u_obj.get("id")
+                f_name = u_obj.get("username", "Unknown")
+                if f_id and f_id not in known_recipients:
+                    friends_to_check.append((f_id, f_name))
+
+        if not friends_to_check:
+            log_info("No additional closed friend chats to process.")
         else:
-            name = f"DM ({dm_id})"
+            total_friends = len(friends_to_check)
+            log_info(f"Identified {Fore.YELLOW}{total_friends}{Style.RESET_ALL} closed friend chat(s) to process sequentially.")
+            log_info(f"{Fore.GREEN}[Safe Protocol Enforced]{Style.RESET_ALL} 5s Delay -> Unhide 1 Chat -> 5s Delay -> Delete Messages -> Re-Close Chat -> 5s Rest -> Next Chat")
 
-        print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
-        print(f"{Fore.MAGENTA}  QUEUE [{idx}/{total_chats}] -> Chat: {Fore.YELLOW}{name}{Fore.MAGENTA} (ID: {dm_id}){Style.RESET_ALL}")
-        print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+            for idx, (f_id, f_name) in enumerate(friends_to_check, 1):
+                print(f"\n{Fore.CYAN}-----------------------------------------------------{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}  HIDDEN CHAT [{idx}/{total_friends}] -> Friend: {Fore.YELLOW}@{f_name}{Fore.CYAN} (ID: {f_id}){Style.RESET_ALL}")
+                print(f"{Fore.CYAN}  Tip: Press [SPACE] at any time to skip this friend chat and move to next!{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}-----------------------------------------------------{Style.RESET_ALL}")
 
-        msgs = scan_channel_user_messages(headers, dm_id, my_user_id, label=name)
-        total_msgs = len(msgs)
+                ch_id = None
+                enable_skip()
+                try:
+                    # 1. Mandatory 5s delay BEFORE unhiding this single chat
+                    log_info(f"Pausing {UNHIDE_PRE_DELAY:.1f}s before unhiding chat with @{f_name}...")
+                    safe_sleep(UNHIDE_PRE_DELAY, 1.5)
 
-        if total_msgs == 0:
-            log_info(f"No sent messages found in {name}. Continuing...")
-            chat_results.append((dm_id, name, 0, 0, 0))
-            continue
+                    # 2. Unhide/open this single chat
+                    dm_data = get_or_create_dm_by_user_id(session, f_id)
+                    if not dm_data or not dm_data.get("id"):
+                        log_warn(f"Could not open/unhide DM with @{f_name}. Skipping to next friend...")
+                        chat_results.append((f_id, f"@{f_name} (Unhide Failed)", 0, 0, 0))
+                        safe_sleep(2.0, 1.0)
+                        continue
 
-        log_success(f"Found {Fore.YELLOW}{total_msgs}{Style.RESET_ALL} sent messages in {name}. Deleting now...")
+                    ch_id = dm_data["id"]
 
-        del_cnt, fail_cnt = delete_message_batch(headers, msgs, base_delay, dry_run)
-        grand_total_found += total_msgs
-        grand_total_deleted += del_cnt
-        grand_total_failed += fail_cnt
-        chat_results.append((dm_id, name, total_msgs, del_cnt, fail_cnt))
+                    # 3. Mandatory 5s delay AFTER unhiding before scanning messages
+                    log_info(f"Pausing {UNHIDE_POST_DELAY:.1f}s after unhide before scanning messages...")
+                    safe_sleep(UNHIDE_POST_DELAY, 1.5)
 
-        # Rest between chats in queue (3.0s - 4.5s)
-        if idx < total_chats:
-            rest_time = random.uniform(BETWEEN_CHAT_REST_MIN, BETWEEN_CHAT_REST_MAX)
-            log_info(f"Resting {rest_time:.1f}s before moving to next DM chat in queue...")
-            safe_sleep(rest_time, 2.5)
+                    # 4. Scan & Delete messages inside this 1 chat
+                    msgs = scan_channel_user_messages(session, ch_id, my_user_id, label=f"DM with @{f_name}")
+                    total_msgs = len(msgs)
+
+                    if total_msgs == 0:
+                        log_info(f"No sent messages found in chat with @{f_name}.")
+                        chat_results.append((ch_id, f"@{f_name}", 0, 0, 0))
+                    else:
+                        log_success(f"Found {Fore.YELLOW}{total_msgs}{Style.RESET_ALL} sent messages in chat with @{f_name}. Deleting now...")
+                        del_cnt, fail_cnt = delete_message_batch(session, msgs, base_delay, dry_run)
+                        grand_total_found += total_msgs
+                        grand_total_deleted += del_cnt
+                        grand_total_failed += fail_cnt
+                        chat_results.append((ch_id, f"@{f_name}", total_msgs, del_cnt, fail_cnt))
+
+                    # 5. Clean up: Re-hide/close this DM channel so client sidebar stays tidy
+                    close_dm_channel(session, ch_id)
+
+                except SkipCurrentTargetException:
+                    print(f"\n{Fore.YELLOW}[>>] [SPACE] pressed! Skipped friend: {Fore.CYAN}@{f_name}{Fore.YELLOW} -> Moving to next friend...{Style.RESET_ALL}")
+                    if ch_id:
+                        close_dm_channel(session, ch_id)
+                    chat_results.append((f_id, f"@{f_name} (Skipped)", 0, 0, 0))
+                finally:
+                    disable_skip()
+
+                # 6. Rest 5s-8s after finishing this chat before moving to the next
+                if idx < total_friends:
+                    rest_time = random.uniform(BETWEEN_UNHIDE_REST_MIN, BETWEEN_UNHIDE_REST_MAX)
+                    log_info(f"Resting {rest_time:.1f}s before proceeding to next friend chat...")
+                    safe_sleep(rest_time, 2.0)
 
     # Print Grand Summary
     print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
@@ -744,10 +997,106 @@ def process_all_dms_queue(
     print(f"{'Channel ID':<20} | {'Target Chat':<20} | {'Found':<6} | {'Deleted':<8}")
     print(f"{'-'*65}")
     for ch_id, target_label, f_cnt, d_cnt, _ in chat_results:
-        if f_cnt > 0:
-            print(f"{ch_id:<20} | {target_label:<20} | {f_cnt:<6} | {d_cnt:<8}")
+        print(f"{ch_id:<20} | {target_label:<20} | {f_cnt:<6} | {d_cnt:<8}")
     print(f"{'-'*65}")
-    log_info(f"Total DM Chats Checked : {total_chats}")
+    log_info(f"Total DM Chats Checked : {len(chat_results)}")
+    log_info(f"Total Messages Found   : {grand_total_found}")
+    log_success(f"Total Messages Deleted : {grand_total_deleted}")
+    if grand_total_failed > 0:
+        log_error(f"Total Failed Deletions : {grand_total_failed}")
+    print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}\n")
+
+def process_all_guilds_queue(
+    session: requests.Session,
+    my_user_id: str,
+    base_delay: float,
+    dry_run: bool,
+    auto_yes: bool = False
+) -> None:
+    """Processes ALL joined Discord servers (guilds) sequentially with safe pacing and cooldowns."""
+    log_info("Fetching your joined Discord Servers (Guilds)...")
+    guilds = fetch_user_guilds(session)
+    total_guilds = len(guilds)
+
+    if total_guilds == 0:
+        log_warn("No joined Discord servers found on this account.")
+        return
+
+    print(f"\n{Fore.CYAN}====================================================={Style.RESET_ALL}")
+    print(f"{Fore.CYAN}   BULK ALL SERVERS QUEUE DELETION INITIALIZED       {Style.RESET_ALL}")
+    print(f"{Fore.CYAN}====================================================={Style.RESET_ALL}")
+    log_info(f"Loaded {Fore.YELLOW}{total_guilds}{Style.RESET_ALL} server(s) in queue.")
+    log_info(f"{Fore.GREEN}[Safe Protocol Enforced]{Style.RESET_ALL} Scan 1 Server -> Delete Messages -> Rest Cooldown ({BETWEEN_GUILD_REST_MIN:.0f}s-{BETWEEN_GUILD_REST_MAX:.0f}s) -> Next Server")
+
+    if not dry_run and not auto_yes:
+        confirm = input(f"\n{Fore.RED}Are you sure you want to process and delete your messages across ALL {total_guilds} servers? (y/N): {Style.RESET_ALL}").strip().lower()
+        if confirm != 'y':
+            log_info("Operation cancelled by user.")
+            return
+
+    grand_total_found = 0
+    grand_total_deleted = 0
+    grand_total_failed = 0
+    guild_results = []
+
+    for idx, g in enumerate(guilds, 1):
+        g_id = g["id"]
+        g_name = g.get("name", "Unknown Server")
+
+        print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}  SERVER [{idx}/{total_guilds}] -> {Fore.YELLOW}{g_name}{Fore.MAGENTA} (ID: {g_id}){Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  Tip: Press [SPACE] at any time to skip this server and move to next!{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+
+        messages_to_delete = []
+        enable_skip()
+        try:
+            messages_to_delete = search_guild_user_messages(session, g_id, my_user_id)
+            if not messages_to_delete:
+                channels = fetch_guild_channels(session, g_id)
+                if channels:
+                    log_info(f"Checking {len(channels)} text channels in {g_name}...")
+                    for ch in channels:
+                        if SKIP_ENABLED and check_skip_pressed():
+                            raise SkipCurrentTargetException("Skipped by user via Spacebar")
+                        ch_msgs = scan_channel_user_messages(session, ch["id"], my_user_id, label=f"#{ch.get('name', ch['id'])}")
+                        if ch_msgs:
+                            messages_to_delete.extend(ch_msgs)
+
+            total_msgs = len(messages_to_delete)
+            if total_msgs == 0:
+                log_info(f"No messages sent by you found in {g_name}. Moving forward...")
+                guild_results.append((g_id, g_name, 0, 0, 0, "Clean (0 msgs)"))
+            else:
+                log_success(f"Found {Fore.YELLOW}{total_msgs}{Style.RESET_ALL} sent message(s) in {g_name}. Deleting now...")
+                del_cnt, fail_cnt = delete_message_batch(session, messages_to_delete, base_delay, dry_run)
+                grand_total_found += total_msgs
+                grand_total_deleted += del_cnt
+                grand_total_failed += fail_cnt
+                guild_results.append((g_id, g_name, total_msgs, del_cnt, fail_cnt, "Completed"))
+
+        except SkipCurrentTargetException:
+            print(f"\n{Fore.YELLOW}[>>] [SPACE] pressed! Skipped server: {Fore.CYAN}{g_name}{Fore.YELLOW} -> Moving to next server...{Style.RESET_ALL}")
+            guild_results.append((g_id, g_name, len(messages_to_delete), 0, 0, "Skipped by User"))
+        finally:
+            disable_skip()
+
+        # Cooldown rest between servers
+        if idx < total_guilds:
+            rest_time = random.uniform(BETWEEN_GUILD_REST_MIN, BETWEEN_GUILD_REST_MAX)
+            log_info(f"Resting {rest_time:.1f}s cooldown before moving to next server...")
+            safe_sleep(rest_time, 2.0)
+
+    # Print Grand Summary Report
+    print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}        ALL SERVERS QUEUE GRAND SUMMARY REPORT       {Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
+    print(f"{'Server ID':<20} | {'Server Name':<22} | {'Found':<6} | {'Deleted':<8} | {'Status':<15}")
+    print(f"{'-'*84}")
+    for g_id, g_label, f_cnt, d_cnt, _, status_txt in guild_results:
+        print(f"{g_id:<20} | {g_label[:20]:<22} | {f_cnt:<6} | {d_cnt:<8} | {status_txt:<15}")
+    print(f"{'-'*84}")
+    log_info(f"Total Servers Checked  : {total_guilds}")
     log_info(f"Total Messages Found   : {grand_total_found}")
     log_success(f"Total Messages Deleted : {grand_total_deleted}")
     if grand_total_failed > 0:
@@ -772,10 +1121,10 @@ def prompt_next_action() -> bool:
         log_info("\nExiting tool. Goodbye!")
         return False
 
-def main():
+def main() -> None:
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="Discord Automated Message Deleter v2.0")
+    parser = argparse.ArgumentParser(description="Discord Automated Message Deleter v2.2")
     parser.add_argument("token_pos", nargs="?", help="Optional Discord User Authorization Token (positional)")
     parser.add_argument("-t", "--token", help="Discord User Authorization Token")
     parser.add_argument("-g", "--guild", help="Discord Server / Guild ID")
@@ -783,13 +1132,15 @@ def main():
     parser.add_argument("-u", "--user", "--users", nargs="*", help="Target User ID(s) (single or bulk queue)")
     parser.add_argument("--all-dms", action="store_true", help="Delete all sent messages across active personal DMs")
     parser.add_argument("--deep-all-dms", action="store_true", help="Deep scan: include hidden friends DMs (ultra-slow human delay)")
+    parser.add_argument("--all-guilds", "--all-servers", action="store_true", help="Delete all sent messages across all joined Discord servers (guilds)")
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-confirm all deletions without confirmation prompts")
-    parser.add_argument("-d", "--delay", type=float, default=2.0, help="Delay between deletions in seconds (default: 2.0s - Anti-Ban Protected)")
+    parser.add_argument("-d", "--delay", type=float, default=None, help="Delay between deletions in seconds (default: 2.0s - Anti-Ban Protected)")
     parser.add_argument("--dry-run", action="store_true", help="Preview messages without deleting them")
     args = parser.parse_args()
 
     print_banner()
 
+    session: requests.Session | None = None
     try:
         # Get Token with getpass (Hidden prompt like Linux password entry)
         token = args.token or args.token_pos or os.getenv("DISCORD_USER_TOKEN")
@@ -800,9 +1151,17 @@ def main():
             log_error("Token is required to proceed!")
             sys.exit(1)
 
+        token = token.strip().strip('"').strip("'")
+        if token.lower().startswith("bot "):
+            log_error("A Bot token was provided! This tool is designed for Discord User Accounts to delete personal messages.")
+            log_warn("Please provide your personal Discord User Authorization Token.")
+            sys.exit(1)
+
+        # Create persistent session with keep-alive & connection pooling
+        session = create_session(token)
+
         # Verify Token
-        headers = get_headers(token)
-        user_info = verify_token(headers)
+        user_info = verify_token(session)
         if not user_info:
             sys.exit(1)
 
@@ -810,13 +1169,16 @@ def main():
         user_id = user_info.get("id")
         log_success(f"Authenticated as: {Fore.GREEN}{username}{Style.RESET_ALL}")
 
-        base_delay = args.delay
         env_delay = os.getenv("DELETE_DELAY")
-        if env_delay and not args.delay:
+        if args.delay is not None:
+            base_delay = args.delay
+        elif env_delay:
             try:
                 base_delay = float(env_delay)
             except ValueError:
-                pass
+                base_delay = 2.0
+        else:
+            base_delay = 2.0
 
         dry_run = args.dry_run or (os.getenv("DRY_RUN", "false").lower() == "true")
         auto_yes = args.yes or (os.getenv("AUTO_CONFIRM", "false").lower() == "true")
@@ -824,12 +1186,17 @@ def main():
         if dry_run:
             log_warn(f"{Fore.YELLOW}DRY RUN MODE ENABLED: No messages will be deleted.{Style.RESET_ALL}")
 
+        # CLI All Servers / Guilds handling
+        if args.all_guilds:
+            process_all_guilds_queue(session, user_id, base_delay, dry_run, auto_yes)
+            sys.exit(0)
+
         # CLI All DMs handling
         if args.deep_all_dms:
-            process_all_dms_queue(headers, user_id, base_delay, dry_run, include_hidden=True)
+            process_all_dms_queue(session, user_id, base_delay, dry_run, include_hidden=True)
             sys.exit(0)
         elif args.all_dms:
-            process_all_dms_queue(headers, user_id, base_delay, dry_run, include_hidden=False)
+            process_all_dms_queue(session, user_id, base_delay, dry_run, include_hidden=False)
             sys.exit(0)
 
         # CLI User IDs handling
@@ -844,28 +1211,29 @@ def main():
             target_guild_id = args.guild
 
             if cli_user_ids:
-                process_bulk_user_queue(headers, cli_user_ids, user_id, base_delay, dry_run)
+                process_bulk_user_queue(session, cli_user_ids, user_id, base_delay, dry_run)
                 break
 
             if not target_channel_id and not target_guild_id:
                 print(f"\n{Fore.GREEN}Select Deletion Scope:{Style.RESET_ALL}")
                 print(f"  {Fore.YELLOW}[1]{Style.RESET_ALL} Delete ALL Sent Messages in Active Open DMs (Safe Pace: 2-3s)")
-                print(f"  {Fore.YELLOW}[2]{Style.RESET_ALL} Deep Scan & Delete: Include Hidden Friends DMs (Ultra-Slow Safe Pace: 2.5s-4.5s)")
+                print(f"  {Fore.YELLOW}[2]{Style.RESET_ALL} Deep Scan & Delete: Include Hidden Friends DMs (Safe 1-by-1 Unhide with 5s Delays & Auto Re-Close)")
                 print(f"  {Fore.YELLOW}[3]{Style.RESET_ALL} Delete messages by User ID(s) (Single or Bulk Queue)")
                 print(f"  {Fore.YELLOW}[4]{Style.RESET_ALL} Delete messages from a specific Personal DM / Group Chat (Pick from list)")
-                print(f"  {Fore.YELLOW}[5]{Style.RESET_ALL} Delete messages from a Discord Server (Guild)")
-                print(f"  {Fore.YELLOW}[6]{Style.RESET_ALL} Exit")
+                print(f"  {Fore.YELLOW}[5]{Style.RESET_ALL} Delete messages from a specific Discord Server (Guild)")
+                print(f"  {Fore.YELLOW}[6]{Style.RESET_ALL} Delete messages across ALL Joined Servers / Groups (Queue with Cooldown)")
+                print(f"  {Fore.YELLOW}[7]{Style.RESET_ALL} Exit")
 
-                choice = input(f"\n{Fore.GREEN}Select option [1-6]: {Style.RESET_ALL}").strip()
+                choice = input(f"\n{Fore.GREEN}Select option [1-7]: {Style.RESET_ALL}").strip()
 
                 if choice == "1":
-                    process_all_dms_queue(headers, user_id, base_delay, dry_run, include_hidden=False)
+                    process_all_dms_queue(session, user_id, base_delay, dry_run, include_hidden=False)
                     if not prompt_next_action():
                         break
                     continue
                 elif choice == "2":
-                    log_warn("Starting Deep Scan with ultra-slow human delays (2.5s - 4.5s per relationship) to prevent Discord detection...")
-                    process_all_dms_queue(headers, user_id, base_delay, dry_run, include_hidden=True)
+                    log_warn("Starting Deep Scan with sequential 1-by-1 unhide, 5s delays, and auto re-close...")
+                    process_all_dms_queue(session, user_id, base_delay, dry_run, include_hidden=True)
                     if not prompt_next_action():
                         break
                     continue
@@ -881,25 +1249,35 @@ def main():
                             break
                         continue
                     
-                    process_bulk_user_queue(headers, parsed_uids, user_id, base_delay, dry_run)
+                    process_bulk_user_queue(session, parsed_uids, user_id, base_delay, dry_run)
                     if not prompt_next_action():
                         break
                     continue
                 elif choice == "4":
-                    target_channel_id = select_dm_channel(headers)
+                    target_channel_id = select_dm_channel(session)
                     if not target_channel_id:
                         log_error("DM Channel selection failed!")
                         if not prompt_next_action():
                             break
                         continue
                 elif choice == "5":
-                    target_guild_id = select_guild_server(headers)
+                    target_guild_id = select_guild_server(session)
                     if not target_guild_id:
                         log_error("Server selection failed!")
                         if not prompt_next_action():
                             break
                         continue
+                    if target_guild_id == "ALL":
+                        process_all_guilds_queue(session, user_id, base_delay, dry_run, auto_yes)
+                        if not prompt_next_action():
+                            break
+                        continue
                 elif choice == "6":
+                    process_all_guilds_queue(session, user_id, base_delay, dry_run, auto_yes)
+                    if not prompt_next_action():
+                        break
+                    continue
+                elif choice == "7":
                     log_info("Exiting tool. Goodbye!")
                     break
                 else:
@@ -909,24 +1287,37 @@ def main():
                     continue
 
             # Message Collection for Guild or Single DM/Channel
-            messages_to_delete: List[Dict[str, Any]] = []
+            messages_to_delete: list[dict[str, Any]] = []
 
-            if target_channel_id:
-                messages_to_delete = scan_channel_user_messages(headers, target_channel_id, user_id, label="target chat")
-            elif target_guild_id:
-                messages_to_delete = search_guild_user_messages(headers, target_guild_id, user_id)
+            enable_skip()
+            try:
+                if target_channel_id:
+                    messages_to_delete = scan_channel_user_messages(session, target_channel_id, user_id, label="target chat")
+                elif target_guild_id:
+                    print(f"{Fore.CYAN}Tip: Press [SPACE] at any time during scanning to skip and return to menu.{Style.RESET_ALL}")
+                    messages_to_delete = search_guild_user_messages(session, target_guild_id, user_id)
 
-                if not messages_to_delete:
-                    log_warn("Search index yielded 0 results. Scanning channels individually...")
-                    channels = fetch_guild_channels(headers, target_guild_id)
-                    log_info(f"Found {len(channels)} text channels in server.")
-                    
-                    for idx, ch in enumerate(channels, 1):
-                        ch_name = ch.get("name", ch.get("id"))
-                        log_info(f"[{idx}/{len(channels)}] Scanning #{ch_name}...")
-                        ch_msgs = scan_channel_user_messages(headers, ch["id"], user_id, label=f"#{ch_name}")
-                        if ch_msgs:
-                            messages_to_delete.extend(ch_msgs)
+                    if not messages_to_delete:
+                        log_warn("Search index yielded 0 results. Scanning channels individually...")
+                        channels = fetch_guild_channels(session, target_guild_id)
+                        log_info(f"Found {len(channels)} text channels in server.")
+                        
+                        for idx, ch in enumerate(channels, 1):
+                            if SKIP_ENABLED and check_skip_pressed():
+                                raise SkipCurrentTargetException("Skipped by user via Spacebar")
+                            ch_name = ch.get("name", ch.get("id"))
+                            log_info(f"[{idx}/{len(channels)}] Scanning #{ch_name}...")
+                            ch_msgs = scan_channel_user_messages(session, ch["id"], user_id, label=f"#{ch_name}")
+                            if ch_msgs:
+                                messages_to_delete.extend(ch_msgs)
+            except SkipCurrentTargetException:
+                print(f"\n{Fore.YELLOW}[>>] [SPACE] pressed! Scanning skipped by user.{Style.RESET_ALL}")
+                disable_skip()
+                if not prompt_next_action():
+                    break
+                continue
+            finally:
+                disable_skip()
 
             total_msgs = len(messages_to_delete)
             if total_msgs == 0:
@@ -949,8 +1340,17 @@ def main():
                         break
                     continue
 
-            # Execute batch deletion
-            del_count, fail_count = delete_message_batch(headers, messages_to_delete, base_delay, dry_run)
+            # Execute batch deletion with Spacebar skip support
+            print(f"{Fore.CYAN}Tip: Press [SPACE] at any time during deletion to stop and return to menu.{Style.RESET_ALL}")
+            enable_skip()
+            del_count = 0
+            fail_count = 0
+            try:
+                del_count, fail_count = delete_message_batch(session, messages_to_delete, base_delay, dry_run)
+            except SkipCurrentTargetException:
+                print(f"\n{Fore.YELLOW}[>>] [SPACE] pressed! Deletion stopped by user.{Style.RESET_ALL}")
+            finally:
+                disable_skip()
 
             print(f"\n{Fore.MAGENTA}====================================================={Style.RESET_ALL}")
             print(f"{Fore.MAGENTA}                  SUMMARY REPORT                     {Style.RESET_ALL}")
@@ -969,11 +1369,16 @@ def main():
             if not prompt_next_action():
                 break
 
+    except TokenRevokedException as e:
+        log_error(f"Execution halted: {e}")
+        log_error("Please check your Discord User Token and log back in.")
+        sys.exit(1)
     except (KeyboardInterrupt, EOFError):
         log_info("\nExiting tool cleanly. Goodbye!")
         sys.exit(0)
+    finally:
+        if session is not None:
+            session.close()
 
 if __name__ == "__main__":
     main()
-
-

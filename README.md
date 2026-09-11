@@ -1,4 +1,4 @@
-# Discord Automated Message Deleter v2.1
+# Discord Automated Message Deleter v2.2
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -6,14 +6,16 @@
 
 A robust, interactive command-line automation tool built in Python to search for and bulk-delete your sent messages across **Discord Servers (Guilds)** and **Personal DMs / Group Chats**.
 
-Equipped with a **Discord Client Fingerprint Shield**, **Adaptive Rate-Limit Protection**, **Randomized Humanized Delays & Jitter**, **Session Safety Limits**, and **Anti-Ban Cooldown Guards** to safeguard your account.
+Equipped with a **Discord Client Fingerprint Shield**, **Adaptive Rate-Limit Protection**, **Connection-Pooled HTTP Keep-Alive**, **Non-Blocking Spacebar Skip**, **Randomized Humanized Delays & Jitter**, **Session Safety Limits**, and **Anti-Ban Cooldown Guards** to safeguard your account.
 
 ---
 
 ## Key Features
 
-- **Anti-Ban & Rate-Limit Shield (v2.1 Hardened):**
+- **Anti-Ban & Rate-Limit Shield (v2.2 Hardened):**
+  - **Connection-Pooled HTTP Keep-Alive:** Reuses active TCP/TLS sessions via persistent `requests.Session` and connection pooling (`HTTPAdapter`), eliminating repeated TLS handshake signatures that trigger Cloudflare/Akamai bot detection.
   - **Discord Client Fingerprinting:** Sends `X-Super-Properties`, `Sec-Ch-Ua`, `Sec-Fetch`, and 10+ additional headers that real Discord clients use, reducing detection of non-client API access.
+  - **Non-Blocking Spacebar Skip:** Press `[SPACE]` at any time during scans, deletions, server channels, or queue processing to instantly skip the current target and advance to the next without killing the program.
   - **Wide Humanized Jitter:** Randomized delays with a `0.2s–1.0s` jitter range, plus a 5% chance of an extra `1.5–4.0s` "human thinking" pause to break up repetitive patterns.
   - **Randomized Cooldown Pauses:** Anti-ban cooldown triggers every `12–25` deletions (randomized interval), with `4–8s` randomized pause duration.
   - **Capped Retry with Escalating Backoff:** All API rate-limit retries are capped at `5 attempts` with increasing backoff per attempt — no more infinite loops.
@@ -158,7 +160,36 @@ python discord_deleter.py --all-dms --dry-run
 
 ---
 
-## CLI Options Reference
+## Legacy Username Badge Manager (`discord_hide_badge.py`)
+
+Automate hiding or toggling the **Legacy Username Badge** ("Originally Known As `#0000`") on your Discord profile across one or multiple accounts.
+
+### Usage:
+
+#### 1. Interactive Mode:
+```bash
+python discord_hide_badge.py
+```
+*(Prompts for token, token list, or file path)*
+
+#### 2. Provide Single or Multiple Tokens via Command Line:
+```bash
+python discord_hide_badge.py -t "USER_TOKEN_1" "USER_TOKEN_2"
+```
+
+#### 3. Provide a Tokens File:
+```bash
+python discord_hide_badge.py -f tokens.txt
+```
+
+#### 4. Restore / Show the Badge:
+```bash
+python discord_hide_badge.py -t "USER_TOKEN" --show
+```
+
+---
+
+## CLI Options Reference (Deleter)
 
 | Option | Short | Description |
 |---|---|---|
@@ -168,10 +199,12 @@ python discord_deleter.py --all-dms --dry-run
 | `--user` / `--users` | `-u` | Target User ID(s) for sequential queue deletion |
 | `--all-dms` | | Clean all sent messages across active open DMs |
 | `--deep-all-dms` | | Deep scan: includes hidden friends DMs with ultra-slow pacing |
+| `--all-guilds` / `--all-servers` | | Clean all sent messages across all joined Discord servers (guilds) |
 | `--yes` | `-y` | Auto-confirm all prompts without asking confirmation |
 | `--delay` | `-d` | Seconds between deletions (Default & enforced minimum: `2.0s`) |
 | `--dry-run` | | Preview messages without deleting |
 | `--help` | `-h` | Show help message and exit |
+
 
 ---
 
@@ -181,14 +214,17 @@ The following built-in protections are **always active** and require no configur
 
 | Protection Layer | Details |
 |---|---|
+| **Connection Pooling** | Persistent HTTP keep-alive with socket reuse via `requests.Session` + `HTTPAdapter` to prevent TLS handshake flags |
 | **Client Fingerprinting** | `X-Super-Properties`, `Sec-Ch-Ua-*`, `Sec-Fetch-*`, and 10+ headers mimicking a real Discord client |
+| **Non-Blocking Spacebar Skip** | `msvcrt` polling skips current target immediately without halting execution or requiring SIGINT |
 | **Wide Humanized Jitter** | `0.2–1.0s` random jitter on every request, plus 5% chance of a `1.5–4.0s` extra pause |
 | **Randomized Cooldowns** | `4–8s` pause every `12–25` deletions (both interval and duration are randomized) |
 | **Capped Retries** | Max `5` retries on rate-limits with escalating backoff (`+0.5–1.5s` per attempt) |
 | **Session Limit Warning** | Warning + `15–30s` forced pause at `500` deletions per session |
 | **Adaptive Delay** | Auto-increases delay on rate-limits (up to `8.0s`), slowly recovers after `20` smooth requests |
-| **Between-Target Rest** | `3–6s` rest between user queue items, `4–8s` rest between DM chats |
-| **Deep Scan Throttle** | `3–6s` per friend check, `2–4s` post-open rest during hidden DM discovery |
+| **Between-Target Rest** | `5–8s` rest between user queue items, `4–8s` rest between active DM chats, `6–10s` between server queues |
+| **Sequential Unhide Protocol** | `5s` pre-unhide delay -> unhides 1 chat -> `5s` post-unhide delay -> deletes messages -> `5–8s` rest -> next chat |
+
 
 > **Tip:** For maximum safety, use `--delay 3.0` or higher and avoid deleting more than 500 messages in a single session. Spread large deletions across multiple days.
 
