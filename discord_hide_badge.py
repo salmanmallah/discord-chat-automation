@@ -316,8 +316,12 @@ def update_legacy_badge_proto(session: requests.Session, hide: bool = True) -> t
     return False, "Exceeded maximum rate limit retries (3/3)"
 
 
-def parse_tokens(token_args: list[str] | None, file_arg: str | None) -> list[str]:
-    """Gathers tokens from arguments, token files, .env, or interactive prompt."""
+def parse_tokens(
+    token_args: list[str] | None = None,
+    file_arg: str | None = None,
+    pos_arg: str | None = None,
+) -> list[str]:
+    """Gathers tokens from arguments, token files, .env, or interactive hidden prompt."""
     tokens = []
 
     if token_args:
@@ -326,6 +330,12 @@ def parse_tokens(token_args: list[str] | None, file_arg: str | None) -> list[str
                 sub_clean = sub_t.strip().strip('"').strip("'")
                 if sub_clean:
                     tokens.append(sub_clean)
+
+    if pos_arg:
+        for item in pos_arg.split(","):
+            sub_clean = item.strip().strip('"').strip("'")
+            if sub_clean:
+                tokens.append(sub_clean)
 
     if file_arg and os.path.exists(file_arg):
         try:
@@ -349,12 +359,10 @@ def parse_tokens(token_args: list[str] | None, file_arg: str | None) -> list[str
                 log_info(f"Loaded {len(tokens)} token(s) from .env configuration.")
 
     if not tokens:
-        print(f"{Fore.YELLOW}No tokens specified via arguments, file, or .env!{Style.RESET_ALL}")
-        print("You can provide:")
-        print("  - A single token (hidden input)")
-        print("  - Multiple tokens separated by commas or spaces")
-        print("  - Path to a text file containing tokens (e.g. tokens.txt)\n")
-        user_input = getpass.getpass(f"{Fore.CYAN}Enter token(s) or file path (hidden input): {Style.RESET_ALL}").strip()
+        user_input = getpass.getpass(f"{Fore.YELLOW}Enter Discord User Token (hidden input): {Style.RESET_ALL}").strip()
+        if not user_input:
+            log_error("Token is required to proceed!")
+            sys.exit(1)
 
         if os.path.isfile(user_input):
             try:
@@ -363,9 +371,10 @@ def parse_tokens(token_args: list[str] | None, file_arg: str | None) -> list[str
                         clean = line.strip().strip('"').strip("'")
                         if clean and not clean.startswith("#"):
                             tokens.append(clean)
+                log_info(f"Loaded {len(tokens)} token(s) from file: {user_input}")
             except OSError as e:
                 log_error(f"Failed to read file {user_input}: {e}")
-        elif user_input:
+        else:
             for item in user_input.replace(",", " ").split():
                 clean = item.strip().strip('"').strip("'")
                 if clean:
@@ -384,17 +393,16 @@ def parse_tokens(token_args: list[str] | None, file_arg: str | None) -> list[str
 
 def process_token(token: str, index: int, total: int, hide: bool = True) -> dict[str, Any]:
     """Processes a single token: validates, inspects proto, updates proto setting, verifies."""
-    masked_token = token[:10] + "..." + token[-6:] if len(token) > 16 else token[:6] + "..."
     action_str = "HIDING" if hide else "SHOWING"
+    header_label = f"[{index}/{total}]" if total > 1 else "[*]"
 
     print(f"\n{Fore.BLUE}==========================================================={Style.RESET_ALL}")
-    print(f"{Fore.CYAN}[{index}/{total}] Processing Account: {Fore.YELLOW}{masked_token}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{header_label} Processing Account...{Style.RESET_ALL}")
     print(f"{Fore.BLUE}==========================================================={Style.RESET_ALL}")
 
     if is_bot_token(token):
-        log_error("Bot token detected! PreloadedUserSettings Protobuf endpoints only support User accounts.")
+        log_error("A Bot token was provided! PreloadedUserSettings Protobuf endpoints only support User accounts.")
         return {
-            "token": masked_token,
             "status": "SKIPPED_BOT_TOKEN",
             "username": "Bot Account",
             "id": "N/A",
@@ -408,7 +416,6 @@ def process_token(token: str, index: int, total: int, hide: bool = True) -> dict
         if not user_data:
             log_error("Token is invalid, expired, or failed authentication check.")
             return {
-                "token": masked_token,
                 "status": "INVALID_TOKEN",
                 "username": "N/A",
                 "id": "N/A",
@@ -421,12 +428,12 @@ def process_token(token: str, index: int, total: int, hide: bool = True) -> dict
         discriminator = user_data.get("discriminator", "0")
         legacy_tag = user_data.get("legacy_username") or (f"#{discriminator}" if discriminator != "0" else "Migrated")
 
+        log_success(f"Authenticated as: {Fore.GREEN}{global_name}{Style.RESET_ALL} (@{username}) [ID: {user_id}]")
+
         # Initial check on proto status
         initial_hidden = get_current_proto_status(session)
         status_label = "HIDDEN" if initial_hidden is True else ("VISIBLE" if initial_hidden is False else "DEFAULT")
 
-        print(f"  {Fore.WHITE}* User:{Style.RESET_ALL} {Fore.GREEN}{global_name}{Style.RESET_ALL} (@{username})")
-        print(f"  {Fore.WHITE}* User ID:{Style.RESET_ALL} {user_id}")
         print(f"  {Fore.WHITE}* Legacy Tag:{Style.RESET_ALL} {Fore.MAGENTA}{legacy_tag}{Style.RESET_ALL}")
         print(f"  {Fore.WHITE}* Current Badge Visibility:{Style.RESET_ALL} {Fore.YELLOW}{status_label}{Style.RESET_ALL}")
 
@@ -457,7 +464,6 @@ def process_token(token: str, index: int, total: int, hide: bool = True) -> dict
             final_status = "FAILED"
 
         return {
-            "token": masked_token,
             "status": final_status,
             "username": f"{global_name} (@{username})",
             "id": user_id,
@@ -472,6 +478,11 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Hide or show the Discord Legacy Username Badge ('Originally Known As') on one or more accounts."
+    )
+    parser.add_argument(
+        "token_pos",
+        nargs="?",
+        help="Optional Discord User Authorization Token (positional).",
     )
     parser.add_argument(
         "-t", "--tokens", "--token",
@@ -504,7 +515,7 @@ def main():
 
     hide_badge = not args.show
 
-    tokens = parse_tokens(args.tokens, args.file)
+    tokens = parse_tokens(args.tokens, args.file, args.token_pos)
 
     if not tokens:
         log_error("No tokens provided. Exiting.")
