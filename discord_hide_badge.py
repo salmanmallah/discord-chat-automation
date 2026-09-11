@@ -8,6 +8,7 @@ hide or show the "Legacy Username Badge" ("Originally Known As") across accounts
 import argparse
 import base64
 import binascii
+import getpass
 import json
 import os
 import random
@@ -350,10 +351,10 @@ def parse_tokens(token_args: list[str] | None, file_arg: str | None) -> list[str
     if not tokens:
         print(f"{Fore.YELLOW}No tokens specified via arguments, file, or .env!{Style.RESET_ALL}")
         print("You can provide:")
-        print("  - A single token")
+        print("  - A single token (hidden input)")
         print("  - Multiple tokens separated by commas or spaces")
         print("  - Path to a text file containing tokens (e.g. tokens.txt)\n")
-        user_input = input(f"{Fore.CYAN}Enter token(s) or file path: {Style.RESET_ALL}").strip()
+        user_input = getpass.getpass(f"{Fore.CYAN}Enter token(s) or file path (hidden input): {Style.RESET_ALL}").strip()
 
         if os.path.isfile(user_input):
             try:
